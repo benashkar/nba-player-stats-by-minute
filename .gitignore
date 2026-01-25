@@ -6,6 +6,9 @@ raw/
 # Checkpoints
 output/checkpoint_*.csv
 
+# MySQL export data
+mysql_export/
+
 # Python
 __pycache__/
 *.py[cod]
