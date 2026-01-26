@@ -57,6 +57,7 @@ TEAM_ABBREV_MAP = {
     'PHO': 'PHX', 'PHOENIX': 'PHX',
     'SA': 'SAS', 'SAN ANTONIO': 'SAS',
     'WSH': 'WAS', 'WASHINGTON': 'WAS',
+    'UTAH': 'UTA',
 }
 
 # Team ID to abbreviation mapping
@@ -195,20 +196,11 @@ def load_gambling_data() -> pd.DataFrame:
 
     odds_df = pd.read_csv(GAMBLING_CSV)
 
-    # FIX: The gambling CSV has home/away columns SWAPPED
-    # The game_id format is DATE_HOME_AWAY but the columns are reversed
-    # Swap them to correct this
-    print("  Fixing swapped home/away columns in gambling data...")
-    odds_df['home_team'], odds_df['away_team'] = odds_df['away_team'].copy(), odds_df['home_team'].copy()
-    odds_df['home_score'], odds_df['away_score'] = odds_df['away_score'].copy(), odds_df['home_score'].copy()
-
-    # Note: The spread appears to have been recorded from the ACTUAL home team's perspective,
-    # so we don't need to flip it - just the team columns and scores
-
-    # Swap moneylines too (these are team-specific)
-    if 'closing_moneyline_home' in odds_df.columns and 'closing_moneyline_away' in odds_df.columns:
-        odds_df['closing_moneyline_home'], odds_df['closing_moneyline_away'] = \
-            odds_df['closing_moneyline_away'].copy(), odds_df['closing_moneyline_home'].copy()
+    # Note: The CSV columns are CORRECT:
+    # - game_id format is DATE_AWAY_HOME (e.g., 20211019_BKN_MIL = BKN @ MIL)
+    # - home_team column contains the home team
+    # - away_team column contains the away team
+    # No swap needed!
 
     # Normalize team abbreviations
     odds_df['home_team'] = odds_df['home_team'].apply(normalize_team_abbrev)
@@ -285,11 +277,16 @@ def create_enhanced_database():
     # Merge with odds data
     print("\nMerging with odds data...")
 
-    # Create match key for games
+    # Create match key for games (try both orderings)
     games_with_teams['match_key'] = (
         games_with_teams['game_date'].astype(str).str[:10] + '_' +
         games_with_teams['home_team'] + '_' +
         games_with_teams['away_team']
+    )
+    games_with_teams['match_key_reverse'] = (
+        games_with_teams['game_date'].astype(str).str[:10] + '_' +
+        games_with_teams['away_team'] + '_' +
+        games_with_teams['home_team']
     )
 
     # Create match key for odds
@@ -299,17 +296,55 @@ def create_enhanced_database():
         odds_df['away_team']
     )
 
-    # Merge
-    games_with_odds = games_with_teams.merge(
-        odds_df[['match_key', 'closing_spread', 'closing_over_under',
+    # Columns to merge from odds
+    odds_cols = ['match_key', 'closing_spread', 'closing_over_under',
                  'closing_moneyline_home', 'closing_moneyline_away',
-                 'home_score', 'away_score']],
+                 'home_score', 'away_score']
+
+    # First merge: try standard match key
+    games_with_odds = games_with_teams.merge(
+        odds_df[odds_cols],
         on='match_key',
         how='left'
     )
 
+    # Second merge: for unmatched games, try reverse key
+    unmatched_mask = games_with_odds['closing_spread'].isna()
+    if unmatched_mask.any():
+        print(f"  First pass: {(~unmatched_mask).sum()} matched, {unmatched_mask.sum()} unmatched")
+
+        # Create odds lookup with reverse key too
+        odds_reverse = odds_df[odds_cols].copy()
+        odds_reverse['match_key'] = odds_df['match_key']  # Keep original key for lookup
+
+        # Merge unmatched on reverse key
+        unmatched_games = games_with_odds[unmatched_mask][['game_id', 'game_date', 'season',
+                                                            'home_team', 'away_team',
+                                                            'match_key', 'match_key_reverse']].copy()
+        reverse_merge = unmatched_games.merge(
+            odds_df[odds_cols],
+            left_on='match_key_reverse',
+            right_on='match_key',
+            how='left',
+            suffixes=('', '_r')
+        )
+
+        # Update the main dataframe with reverse matches
+        reverse_matched = reverse_merge['closing_spread'].notna()
+        if reverse_matched.any():
+            print(f"  Second pass (reverse key): {reverse_matched.sum()} additional matches")
+            # Update the games_with_odds rows where we found reverse matches
+            for idx in reverse_merge[reverse_matched].index:
+                game_id = reverse_merge.loc[idx, 'game_id']
+                main_idx = games_with_odds[games_with_odds['game_id'] == game_id].index
+                if len(main_idx) > 0:
+                    for col in ['closing_spread', 'closing_over_under',
+                                'closing_moneyline_home', 'closing_moneyline_away',
+                                'home_score', 'away_score']:
+                        games_with_odds.loc[main_idx[0], col] = reverse_merge.loc[idx, col]
+
     matched = games_with_odds['closing_spread'].notna().sum()
-    print(f"  Matched {matched} / {len(games_with_odds)} games with odds ({matched/len(games_with_odds)*100:.1f}%)")
+    print(f"  Total matched {matched} / {len(games_with_odds)} games with odds ({matched/len(games_with_odds)*100:.1f}%)")
 
     # Save enhanced games table
     print("\nSaving enhanced database...")
